@@ -1,12 +1,14 @@
 from openai import OpenAI
 from pydantic import BaseModel
-from typing import Literal, Any
+from typing import Literal, Any, Callable
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 from dataclasses import dataclass
 import hashlib
+import time
+import random
 
 client = OpenAI()
 
@@ -356,6 +358,61 @@ def execute_action_plan(
         next_action_index=len(actions)
         )
 
+def execute_with_retries(
+        actions: list[dict[str, str]],
+        ticket_id: int,
+        plan_id: str,
+        ticket_system: MockTicketSystem,
+        audit_logger: AuditLogger,
+        max_retries: int = 3,
+        base_delay: float = 0.5,
+        max_delay: float = 8.0,
+        sleep_fn: Callable[[float], None] = time.sleep
+) -> ExecutionResult:
+
+    if max_retries < 0 or max_delay < 0 or base_delay < 0:
+        raise ValueError("Retry settings cannot be negative")
+
+    start_index = 0
+    retry_count = 0
+
+    while True:
+        result = execute_action_plan(actions=actions,ticket_id=ticket_id, ticket_system=ticket_system,
+                            audit_logger=audit_logger, plan_id=plan_id, start_index=start_index)
+
+        if result.status == "needs_review":
+            return result
+
+        if result.status == "completed":
+            return result
+
+        if result.status != "retryable_failure":
+            raise RuntimeError(f"Uknown execution status: {result.status}")
+
+        if start_index != result.next_action_index:
+            retry_count = 0
+
+        start_index = result.next_action_index
+
+        if retry_count >= max_retries:
+            print("Maximum number of retries reached")
+            return result
+
+        delay_cap = min(
+            max_delay,
+            base_delay * (2 ** retry_count)
+        )
+
+        delay = random.uniform(0, delay_cap)
+
+        retry_count += 1
+
+        print(f"Temporary failure at action: {start_index}.")
+        print(f"Retry # {retry_count}/{max_retries}")
+        print(f"in {delay:.2f} seconds")
+
+        sleep_fn(delay)
+    
 def run_stream(user_input: str, previous_response_id:str|None)->tuple[str, str, Triage]:
 
     with client.responses.stream(
@@ -472,6 +529,58 @@ def test_idempotency():
     assert result2.status == "completed"
     assert len(ticket["response_drafts"]) == 1
 
+def test_automatic_retries():
+    ticket_system = MockTicketSystem()
+    audit_logger = AuditLogger()
+
+    ticket_id = ticket_system.create_ticket("checkout unavailable")
+    plan_id = str(uuid4())
+    actions = [
+        {"action": "assign_team", "team": "sre"},
+        {"action": "set_priority", "priority": "critical"},
+        {
+            "action": "draft_response",
+            "message": "We are investigating this issue."
+        }
+    ]
+
+    ticket_system.inject_failure("set_priority", "temporary")
+
+    result = execute_with_retries(actions,ticket_id,plan_id, ticket_system,audit_logger)
+
+    print(result)
+
+def test_retry_exhaustion():
+    from unittest.mock import patch
+
+    ticket_system = MockTicketSystem()
+    audit_logger = AuditLogger("exhaustion_test.jsonl")
+
+    actions = [
+        {"action": "set_priority",
+         "priority": "low"}
+    ]
+
+    ticket_id = ticket_system.create_ticket("user cannot login")
+    plan_id = str(uuid4())
+    with patch.object(
+        ticket_system,
+        "_before_action",
+        side_effect=TemporaryTicketError("Service Unavailable")
+    ):
+        result = execute_with_retries(
+            actions,
+            ticket_id,
+            plan_id,
+            ticket_system,
+            audit_logger
+
+        )
+
+    assert result.status == "retryable_failure"
+    assert result.next_action_index == 0
+    print(ticket_system.get_ticket(ticket_id))
+
 def main():
 
     ticket_system = MockTicketSystem()
@@ -505,13 +614,16 @@ def main():
 
         plan_id = str(uuid4())
 
-        result = execute_action_plan(
+        result = execute_with_retries(
             actions,
             active_ticket_id,
+            plan_id,
             ticket_system,
             audit_logger,
-            plan_id=plan_id
-            )
+            max_retries = 3,
+            base_delay = 0.5,
+            max_delay = 8.0
+        )
 
         print(f"\nExecution status: {result.status}")
 
@@ -530,4 +642,5 @@ def main():
 
 if __name__ == "__main__":
     # main()
-    test_idempotency()
+    # test_automatic_retries()
+    test_retry_exhaustion()
