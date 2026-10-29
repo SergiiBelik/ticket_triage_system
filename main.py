@@ -91,6 +91,8 @@ class MockTicketSystem:
         self.applied_actions = {}
 
     def create_ticket(self, description: str) -> int:
+        '''Returns ticket id'''
+
         ticket_id = self.next_ticket_id
         self.next_ticket_id += 1
 
@@ -367,13 +369,13 @@ def execute_with_retries(
         max_retries: int = 3,
         base_delay: float = 0.5,
         max_delay: float = 8.0,
-        sleep_fn: Callable[[float], None] = time.sleep
+        sleep_fn: Callable[[float], None] = time.sleep,
+        start_index: int = 0
 ) -> ExecutionResult:
 
     if max_retries < 0 or max_delay < 0 or base_delay < 0:
         raise ValueError("Retry settings cannot be negative")
 
-    start_index = 0
     retry_count = 0
 
     while True:
@@ -581,6 +583,107 @@ def test_retry_exhaustion():
     assert result.next_action_index == 0
     print(ticket_system.get_ticket(ticket_id))
 
+def reconcile_unknown_outcome(
+        result: ExecutionResult,
+        ticket_id: int,
+        actions: list[dict],
+        ticket_system: MockTicketSystem,
+        audit_logger: AuditLogger,
+        plan_id: str
+) -> ExecutionResult:
+
+    if result.status != "needs_review" or result.error_type != "UnknownTicketError":
+        return result
+
+    index = result.next_action_index
+
+    if not 0 <= index < len(actions):
+        raise ValueError("Invalid action index")
+
+    action_id = f"{plan_id}:{index}"
+    action = actions[index]
+
+    print(f"\nReconciling index: {action_id}")
+
+    try:
+        was_applied = ticket_system.action_already_applied(ticket_id, action_id, action)
+
+    except Exception as exc:
+        print(f"Reconciliation failed: {type(exc).__name__}")
+        return result
+
+    audit_logger.record(
+        ticket_id,
+        operation_id = str(uuid4()),
+        action=action["action"],
+        action_id = action_id,
+        status=("Action was already applied" if was_applied else "Unknown"),
+        parameters={}
+    )
+
+    if not was_applied:
+        print("Action receipt is unknown. Manual review is required")
+        return result
+
+    print("Action confirmed to be applied. Resuming execution.")
+
+    return execute_with_retries(actions,ticket_id,plan_id,ticket_system,audit_logger, start_index=index)
+
+def test_reconciliation():
+
+    ticket_system = MockTicketSystem()
+    audit_logger = AuditLogger("reconciliation_test.jsonl")
+
+    ticket_id = ticket_system.create_ticket("Users cannot checkout")
+    plan_id = str(uuid4())
+
+    actions = [
+        {
+            "action": "assign_team",
+            "team": "sre"
+        },
+        {
+            "action": "set_priority",
+            "priority": "major"
+        },
+        {
+            "action": "escalate",
+            "value": "sre"
+        },
+        {
+            "action": "draft_response",
+            "message": "We are invesgitating the issue"
+        }
+    ]
+
+    ticket_system.inject_failure("set_priority", "unknown")
+
+    result = execute_with_retries(actions,ticket_id,plan_id,ticket_system,audit_logger)
+
+    print(f"Result before reconciliation: {result}")
+    assert result.status == "needs_review"
+    assert result.next_action_index == 1
+
+    # Priority was actually updated
+    ticket = ticket_system.get_ticket(ticket_id)
+    assert ticket["priority"] == "major"
+
+    # Remaining actions did not execute
+    assert ticket["escalated"] is False
+    assert len(ticket["response_drafts"]) == 0
+
+    result = reconcile_unknown_outcome(result,ticket_id,actions,ticket_system,audit_logger, plan_id)
+
+    print(f"Result AFTER reconciliation: {result}")
+    ticket = ticket_system.get_ticket(ticket_id)
+    assert result.status=="completed"
+    assert ticket["escalated"] is True
+    assert ticket["priority"] == "major"
+    assert len(ticket["response_drafts"]) == 1
+
+    print("Reconciliation test passed!")
+
+
 def main():
 
     ticket_system = MockTicketSystem()
@@ -643,4 +746,5 @@ def main():
 if __name__ == "__main__":
     # main()
     # test_automatic_retries()
-    test_retry_exhaustion()
+    # test_retry_exhaustion()
+    test_reconciliation()
