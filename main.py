@@ -687,14 +687,20 @@ def test_reconciliation():
 def main():
 
     ticket_system = MockTicketSystem()
-    ticket_system.inject_failure("draft_response", "unknown")
     audit_logger = AuditLogger()
+
     previous_response_id = None
     active_ticket_id = None
+    pending_plan = None
+
     while True:
         if active_ticket_id is None:
             print("\n*** Enter your ticket details ***")
-            print('type "exit" to quit, "new" to enter new ticket')
+            print('Type "exit" to quit, "new" to enter new ticket')
+
+        elif pending_plan is not None:
+            print(f"There's paused ticket {active_ticket_id}")
+            print("What do you want to do? 'Reconcile', 'Retry', 'New', 'Exit'?")
         
         incoming_ticket = input("\nYou: ").strip()
         user_input = incoming_ticket.lower()
@@ -702,11 +708,98 @@ def main():
         if user_input == "exit":
             break
         if user_input == "new":
+
+            if pending_plan is not None:
+                confirmation = input(
+                    "There's a ticket with unresolved actions."
+                    "Do you want to abandon? (y/n): ").strip().lower()
+
+                if confirmation != "y":
+                    continue
+            
             previous_response_id = None
             active_ticket_id = None
+            pending_plan = None
             continue
 
-        if not user_input:
+        if not incoming_ticket:
+            continue
+
+        # ------------------------------------------
+        #  RECOVER AN UNFINISHED ACTION PLAN
+        # ------------------------------------------
+        if pending_plan is not None:
+
+            previous_result = pending_plan["result"]
+
+            if user_input == "reconcile":
+
+                if (previous_result.status != "needs_review"
+                    or previous_result.error_type not in {
+                    "UnknownTicketError"
+                }):
+                    print("This failure cannot be reconciled automatically.")
+                    continue
+
+
+                result = reconcile_unknown_outcome(
+                    result = previous_result,
+                    ticket_id = active_ticket_id,
+                    actions=pending_plan["actions"],
+                    ticket_system = ticket_system,
+                    audit_logger = audit_logger,
+                    plan_id=pending_plan["plan_id"]
+                )
+
+            elif user_input == "retry":
+
+                if previous_result.status != "retryable_failure":
+                    print("This failure is not retryable")
+                    continue
+
+                result = execute_with_retries(
+                    pending_plan["actions"],
+                    active_ticket_id,
+                    pending_plan["plan_id"],
+                    ticket_system,
+                    audit_logger,
+                    start_index=previous_result.next_action_index
+                )
+
+            else:
+                print(
+                    "This ticket has unresolved actions."
+                    "Resolve them before submitting more information."
+                )
+                continue
+
+            print(f"Execution status: {result.status}")
+
+            if result.status == "completed":
+                print("All actions completed successfully")
+                pending_plan = None
+
+            else:
+                pending_plan["result"] = result
+                print(
+                    f"Ticket remains paused. Error: {result.error_type}"
+                )
+
+            print(
+                json.dump(
+                    ticket_system.get_ticket(active_ticket_id),
+                    indent=2
+                )
+            )
+
+            continue
+
+        # -----------------------------------------
+        # NORMAL TICKET TRIAGE AND AUTOMATION
+        # -----------------------------------------
+
+        if user_input in {"reconcile", "retry"}:
+            print("There is not pending action plan")
             continue
 
         if active_ticket_id is None:
@@ -730,21 +823,42 @@ def main():
 
         print(f"\nExecution status: {result.status}")
 
-        if result.status == "retryable_failure":
-            print(
-                f"Temporary failure at action index {result.next_action_index}."
-                "This action is eligible for controlled retry"
-            )
-        elif result.status == "needs_review":
-            print(f"Action requires review: {result.error_type}")
-        elif result.status == "completed":
+        if result.status == "completed":
             print("All actions executed successfully")
 
+        else:
+            # Preserve the original plan for recovery
+            pending_plan = {
+                "actions": actions,
+                "plan_id": plan_id,
+                "result": result
+            }
+            if result.status == "retryable_failure":
+                print(
+                    "Retries exhausted at action:"
+                    f"{result.next_action_index}"
+                    f'Type "retry" to try again.'
+                )
+            elif result.status == "needs_review":
+                print(f"Action needs review: {result.error_type}")
+
+                if result.error_type in {
+                    "UnknownTicketError"
+                }:
+                    print('Type "reconcile" to check the outcome')
+
         print(f"\nTicket {active_ticket_id} updated")
-        print(json.dumps(ticket_system.get_ticket(active_ticket_id), indent=2))
+        print(
+            json.dumps(
+                ticket_system.get(active_ticket_id),
+                indent=2
+            )
+        )
+
+
 
 if __name__ == "__main__":
-    # main()
+    main()
     # test_automatic_retries()
     # test_retry_exhaustion()
-    test_reconciliation()
+    # test_reconciliation()
