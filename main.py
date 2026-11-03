@@ -10,8 +10,6 @@ import hashlib
 import time
 import random
 
-client = OpenAI()
-
 instructions = """
 You are a technical support ticket triage system.
 
@@ -416,6 +414,7 @@ def execute_with_retries(
         sleep_fn(delay)
     
 def run_stream(user_input: str, previous_response_id:str|None)->tuple[str, str, Triage]:
+    client = OpenAI()
 
     with client.responses.stream(
         model="gpt-6-luna",
@@ -687,6 +686,7 @@ def test_reconciliation():
 def main():
 
     ticket_system = MockTicketSystem()
+    ticket_system.inject_failure("draft_response", "unknown")
     audit_logger = AuditLogger()
 
     previous_response_id = None
@@ -786,7 +786,7 @@ def main():
                 )
 
             print(
-                json.dump(
+                json.dumps(
                     ticket_system.get_ticket(active_ticket_id),
                     indent=2
                 )
@@ -850,7 +850,7 @@ def main():
         print(f"\nTicket {active_ticket_id} updated")
         print(
             json.dumps(
-                ticket_system.get(active_ticket_id),
+                ticket_system.get_ticket(active_ticket_id),
                 indent=2
             )
         )
