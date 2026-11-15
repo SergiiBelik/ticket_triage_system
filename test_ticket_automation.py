@@ -5,7 +5,10 @@ from main import (
     MockTicketSystem,
     AuditLogger,
     execute_with_retries,
-    reconcile_unknown_outcome
+    reconcile_unknown_outcome,
+    Triage,
+    create_action_plan,
+    TemporaryTicketError,
 )
 # ----------------------
 # Shared test setup
@@ -195,4 +198,52 @@ def test_audit_logging(test_environment):
 
     assert started_ids == succeeded_ids
 
-    
+def test_retry_exhaustion(test_environment, monkeypatch):
+    system, logger, ticket_id, actions, audit_path = test_environment
+
+    def always_fail(action):
+        raise TemporaryTicketError("Service Unavailable")
+
+    monkeypatch.setattr(
+        system,
+        "_before_action",
+        always_fail
+    )
+
+    result = execute_with_retries(
+        actions=actions,
+        ticket_id=ticket_id,
+        plan_id = str(uuid4()),
+        ticket_system=system,
+        audit_logger=logger,
+        max_retries=2
+    )
+
+    assert result.status == "retryable_failure"
+    assert result.next_action_index == 0
+
+    ticket = system.get_ticket(ticket_id)
+
+    # No modifications should have occurred
+
+    assert ticket["priority"] is None
+    assert ticket["assigned_team"] is None
+    assert len(ticket["response_drafts"]) == 0
+
+    events = [
+        json.loads(line) for line in audit_path.read_text().splitlines()
+    ]
+
+    started = [
+        e for e in events if e["status"] == "started"
+    ]
+
+    failed = [
+        e for e in events if e["status"] == "failed"
+    ]
+
+    assert len(started) == 3
+    assert len(failed) == 3
+
+    assert len({e["action_id"] for e in started}) == 1
+    assert len({e["operation_id"] for e in started}) == 3
